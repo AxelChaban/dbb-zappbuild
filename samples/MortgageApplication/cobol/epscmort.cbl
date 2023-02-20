@@ -74,7 +74,7 @@
 
        EPSCMORT-MAINLINE.
       * Call procedure to do SQL call
-TSTDBB     Display "AxelDBB".
+TSTDBB     Display "AxelDBB1".
            PERFORM A805-DUMMY-SQL-CALL
            MOVE LENGTH OF DFHCOMMAREA to W-COMAREA-LENGTH.
            MOVE DFHCOMMAREA to W-COMMUNICATION-AREA.
