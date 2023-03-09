@@ -1,10 +1,10 @@
 # Releng properties used by language/Cobol.groovy
 
 #
-# Comma separated list of required build properties for Cobol.groovy  j'ai enleve manuellement SDHFCOB, SDFHLOAD,SDSNLOAD,
+# Comma separated list of required build properties for Cobol.groovy
 cobol_requiredBuildProperties=cobol_srcPDS,cobol_cpyPDS,cobol_objPDS,cobol_loadPDS,\
   cobol_compiler,cobol_linkEditor,cobol_tempOptions,applicationOutputsCollectionName,\
-  SCEELKED, \
+  SDFHCOB,SDFHLOAD,SDSNLOAD,SCEELKED, \
   cobol_dependencySearch
 
 #
