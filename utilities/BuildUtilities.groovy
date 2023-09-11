@@ -9,12 +9,17 @@ import groovy.json.JsonSlurper
 import com.ibm.dbb.build.DBBConstants.CopyMode
 import com.ibm.dbb.build.report.records.*
 import com.ibm.jzos.FileAttribute
+import java.nio.file.FileSystems
+import java.nio.file.Path
+import java.nio.file.PathMatcher
 import groovy.ant.*
 
 // define script properties
 @Field BuildProperties props = BuildProperties.getInstance()
 @Field HashSet<String> copiedFileCache = new HashSet<String>()
 @Field def gitUtils = loadScript(new File("GitUtilities.groovy"))
+@Field def dependencyScannerUtils= loadScript(new File("DependencyScannerUtilities.groovy"))
+
 
 /*
  * assertBuildProperties - verify that required build properties for a script exist
@@ -26,7 +31,7 @@ def assertBuildProperties(String requiredProps) {
 
 		buildProps.each { buildProp ->
 			buildProp = buildProp.trim()
-			assert props."$buildProp" : "*! Missing required build property '$buildProp'"
+			assert (props."$buildProp" || !(new PropertyMappings("$buildProp").getValues().isEmpty())) : "*! Missing required build property '$buildProp'"
 		}
 	}
 }
@@ -113,7 +118,11 @@ def copySourceFiles(String buildFile, String srcPDS, String dependencyDatasetMap
 
 		// Manually create logical file for the user build program
 		String lname = CopyToPDS.createMemberName(buildFile)
-		String language = props.getFileProperty('dbb.DependencyScanner.languageHint', buildFile) ?: 'UNKN'
+		def scanner = dependencyScannerUtils.getScanner(buildFile)
+		String language = 'UNKN'
+		if (scanner instanceof com.ibm.dbb.dependency.DependencyScanner && ((DependencyScanner) scanner).getLanguageHint() != null) {
+			language = ((DependencyScanner) scanner).getLanguageHint()
+		}
 		LogicalFile lfile = new LogicalFile(lname, buildFile, language, depFileData.isCICS, depFileData.isSQL, depFileData.isDLI)
 
 		// get list of dependencies from userBuildDependencyFile
@@ -465,19 +474,6 @@ def relativizeFolderPath(String folder, String path) {
 	return path
 }
 
-/*
- * getScannerInstantiates - returns the mapped scanner or default scanner
- */
-def getScanner(String buildFile){
-	if (props.runzTests && props.runzTests.toBoolean()) {
-		scannerUtils= loadScript(new File("ScannerUtilities.groovy"))
-		scanner = scannerUtils.getScanner(buildFile)
-	}
-	else {
-		if (props.verbose) println("*** Scanning file with the default scanner")
-		scanner = new DependencyScanner()
-	}
-}
 
 /*
  * createLanguageDatasets - gets the language used to create the datasets
@@ -510,39 +506,14 @@ def createDatasets(String[] datasets, String options) {
 }
 
 /*
- * returns languagePrefix for language script name or null if not defined.
+ * returns languagePrefix from the name of the language script
+ * 
+ *  that is assumed to be the base name of the script, 
+ *  respectively the name until the first '_'
+ *  
  */
 def getLangPrefix(String scriptName){
-	def langPrefix = null
-	switch(scriptName) {
-		case "Cobol.groovy":
-			langPrefix = 'cobol'
-			break;
-		case "LinkEdit.groovy" :
-			langPrefix = 'linkedit'
-			break;
-		case "PLI.groovy":
-			langPrefix = 'pli'
-			break;
-		case "Assembler.groovy":
-			langPrefix = 'assembler'
-			break;
-		case "BMS.groovy":
-			langPrefix = 'bms'
-			break;
-		case "DBDgen.groovy":
-			langPrefix = 'dbdgen'
-			break;
-		case "MFS.groovy":
-			langPrefix = 'mfs'
-			break;
-		case "PSBgen.groovy":
-			langPrefix = 'psbgen'
-			break;
-		default:
-			if (props.verbose) println ("*** ! No language prefix defined for $scriptName.")
-			break;
-	}
+	langPrefix = scriptName.takeWhile{it != '.' && it != '_'}.toLowerCase()
 	return langPrefix
 }
 
@@ -787,3 +758,147 @@ def getShortGitHash(String buildFile) {
 	if (props.verbose) println "*! Could not obtain abbreviated githash for buildFile $buildFile"
 	return null
 }
+
+
+/**
+ * createPathMatcherPattern
+ * Generic method to build PathMatcher from a build property
+ */
+
+def createPathMatcherPattern(String property) {
+	List<PathMatcher> pathMatchers = new ArrayList<PathMatcher>()
+	if (property) {
+		property.split(',').each{ filePattern ->
+			if (!filePattern.startsWith('glob:') || !filePattern.startsWith('regex:'))
+				filePattern = "glob:$filePattern"
+			PathMatcher matcher = FileSystems.getDefault().getPathMatcher(filePattern)
+			pathMatchers.add(matcher)
+		}
+	}
+	return pathMatchers
+}
+
+/**
+ * matches
+ * Generic method to validate if a file is matching any pathmatchers  
+ * 
+ */
+def matches(String file, List<PathMatcher> pathMatchers) {
+	def result = pathMatchers.any { matcher ->
+		Path path = FileSystems.getDefault().getPath(file);
+		if ( matcher.matches(path) )
+		{
+			return true
+		}
+	}
+	return result
+}
+
+/**
+ * generates the IdentifyStatement for the Binder
+ * 
+ * parameter:
+ *  buildFile
+ * 
+ * returns:  
+ *  - IDENTIFY string following the pattern:
+ *    <application>/<abbreviatedGitHash>
+ *  
+ *  - null if statement cannot be generated 
+ *   
+ * additional information:
+ *  https://www.ibm.com/docs/en/zos/2.5.0?topic=reference-identify-statement
+ * 
+ */
+def generateIdentifyStatement(String buildFile, String dsProperty) {
+
+    def String identifyStmt
+
+	int maxRecordLength = dsProperty.toLowerCase().contains("library") ? 80 : 40
+	
+    if((props.mergeBuild || props.impactBuild || props.fullBuild) && MetadataStoreFactory.getMetadataStore() != null) {
+
+        String member = CopyToPDS.createMemberName(buildFile)
+        String shortGitHash = getShortGitHash(buildFile)
+
+        if (shortGitHash != null) {
+
+            String identifyString = props.application + "/" + shortGitHash
+            //   IDENTIFY EPSCSMRT('MortgageApplication/abcabcabc')
+            identifyStmt = "  " + "IDENTIFY ${member}(\'$identifyString\')"
+            if (identifyString.length() > maxRecordLength) {
+                String errorMsg = "*!* BuildUtilities.generateIdentifyStatement() - Identify string exceeds $maxRecordLength chars: identifyStmt=$identifyStmt"
+                println(errorMsg)
+                props.error = "true"
+                updateBuildResult(errorMsg:errorMsg)
+                return null
+            } else {
+                return identifyStmt
+            }
+			} else {
+            println("*!* BuildUtilities.generateIdentifyStatement() - Could not obtain abbreviated git hash for $buildFile")
+            return null
+            }
+
+    } else {
+        return null
+        }
+    }
+
+/**
+ * method to print the logicalFile attributes (CICS, SQL, DLI, MQ) of a scanned file 
+ * and indicating if an attribute is overridden through a property definition.
+ * 
+ * sample output:
+ * Program attributes: CICS=true, SQL=true*, DLI=false, MQ=false
+ * 
+ * additional notes:
+ * An suffixed asterisk (*) of the value for an attribute is indicating if a property definition 
+ * is overriding the value. When the values are identical, no asterisk is presented, even when 
+ * a property is setting the same value.
+ * 
+ * This is implementing 
+ * https://github.com/IBM/dbb-zappbuild/issues/339
+ *  
+*/
+
+def printLogicalFileAttributes(LogicalFile logicalFile) {
+	String cicsFlag = (logicalFile.isCICS() == isCICS(logicalFile)) ? "${logicalFile.isCICS()}" : "${isCICS(logicalFile)}*"
+	String sqlFlag = (logicalFile.isSQL() == isSQL(logicalFile)) ? "${logicalFile.isSQL()}" : "${isSQL(logicalFile)}*"
+	String dliFlag = (logicalFile.isDLI() == isDLI(logicalFile)) ? "${logicalFile.isDLI()}" : "${isDLI(logicalFile)}*"
+	String mqFlag = (logicalFile.isMQ() == isMQ(logicalFile)) ? "${logicalFile.isMQ()}" : "${isMQ(logicalFile)}*"
+	
+	println "Program attributes: CICS=$cicsFlag, SQL=$sqlFlag, DLI=$dliFlag, MQ=$mqFlag"
+	
+}
+
+/**
+ * method to load build properties into the DBB Build properties.
+ * 
+ * takes the path to the property file, validates if the property file exist
+ *  
+ */
+
+def loadBuildProperties(String propertyFile) {
+	File propFile = new File("$propertyFile")
+	if (propFile.exists()) {
+		props.load(propFile)
+	} else {
+		println "*!* The specified $propertyFile does not exist. Build exits."
+		System.exit(1)
+	}
+}
+
+/**
+ * Validates if a buildFile is a zUnit generated test case program
+ * 
+ *  returns true / false
+ *  
+ */
+def isGeneratedzUnitTestCaseProgram(String buildFile) {
+	if (props.getFileProperty('cobol_testcase', buildFile).equals('true') || props.getFileProperty('pli_testcase', buildFile).equals('true')) {
+		return true
+	}
+	return false
+}
+
